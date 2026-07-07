@@ -15,6 +15,7 @@ from typing import Any
 import click
 
 from . import graph
+from . import info as pkg_info
 from .errors import AtsxError
 from .parser import (
     MANIFEST_NAME,
@@ -564,16 +565,36 @@ def mark(path: Path, step_id: str, status_value: str) -> None:
 
 
 @cli.command()
-@click.argument("info", type=click.Path(exists=True, path_type=Path))
-def info() -> None:
-    """Info about .atsx"""
+@click.argument("path", type=click.Path(exists=True, path_type=Path), required=False, default=None)
+@click.option("--json", "as_json", is_flag=True, help="Print machine-readable JSON instead of human-readable text.")
+def info(path: Path | None, as_json: bool) -> None:
+    """Show info about PATH (a .atsx file or unpacked project folder).
+
+    If PATH is omitted, show the atlas parser's own version/author instead.
+    """
+    if path is None:
+        if as_json:
+            click.echo(json.dumps({
+                "parser": pkg_info.title, "version": pkg_info.version, "author": pkg_info.author, "license": pkg_info.license,
+            }, indent=2))
+            return
+        click.echo(f"Parser: {pkg_info.title}")
+        click.echo(f"Version: {pkg_info.version}")
+        click.echo(f"Author: {pkg_info.author}")
+        click.echo(f"License: {pkg_info.license}")
+        return
+
     try:
-        project = _load_project(info)
+        project = _load_project(path)
     except AtsxError as exc:
         click.echo(str(exc), err=True)
         raise SystemExit(1)
 
     meta = project.manifest.get("meta", {})
+    if as_json:
+        click.echo(json.dumps({"path": str(path), "meta": _meta_json(meta)}, indent=2))
+        return
+
     click.echo(f"Build: {meta.get('id')} v{meta.get('version')}")
     click.echo(f"Title: {meta.get('title')}")
     click.echo(f"Kind: {meta.get('kind')}")
