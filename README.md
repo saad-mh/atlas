@@ -283,7 +283,7 @@ If several people build from the same `.atsx`, the reader app can maintain multi
 ## 9. Roadmap sketch
 
 - [ ] `0.1` - this spec, frozen enough to build against.
-- [ ] JSON Schema for `manifest.atsx.yaml` and `state.atsx.yaml` (validation).
-- [ ] Reference CLI: `atlas validate`, `atlas status`, `atlas pack` (folder → `.atsx`), `atlas unpack`.
+- [x] JSON Schema for `manifest.atsx.yaml` and `state.atsx.yaml` (validation).
+- [x] Reference CLI: `atlas validate`, `atlas status`, `atlas pack` (folder → `.atsx`), `atlas unpack`. See [CLI.md](CLI.md).
 - [ ] Reader app: renders resources / process / state as distinct views, handles branch prompts, tracks progress.
 - [ ] `1.0` once schema + CLI + one real project (yours) have round-tripped cleanly.
