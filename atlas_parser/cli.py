@@ -5,8 +5,10 @@ A thin layer over atlas_parser's core: this module is the onlyx place in the pac
 
 from __future__ import annotations
 
+import json
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +16,17 @@ import click
 
 from . import graph
 from .errors import AtsxError
-from .parser import MANIFEST_NAME, parse_atsx, parse_manifest_file, parse_state_file
+from .parser import (
+    MANIFEST_NAME,
+    STATE_NAME,
+    parse_atsx,
+    parse_manifest_file,
+    parse_state_file,
+    write_state_file,
+    write_state_to_atsx,
+)
+from .schemas import validate_state
 
-STATE_NAME = "state.atsx.yaml"
 RESOURCES_DIR = "resources"
 ATTACHMENTS_DIR = "attachments"
 
@@ -36,6 +46,8 @@ class LoadedProject:
     manifest: dict[str, Any]
     state: dict[str, Any] | None
     file_names: set[str]
+    state_names: list[str] = field(default_factory=list)
+    state_using: str | None = None
 
 
 def _load_project(path: Path) -> LoadedProject:
@@ -52,12 +64,26 @@ def _load_project(path: Path) -> LoadedProject:
             for p in path.rglob("*")
             if p.is_file()
         }
-        return LoadedProject(manifest=manifest, state=state, file_names=file_names)
+        state_names = [STATE_NAME] if state_path.is_file() else []
+        return LoadedProject(
+            manifest=manifest, state=state, file_names=file_names,
+            state_names=state_names, state_using=(STATE_NAME if state is not None else None),
+        )
 
     container = parse_atsx(path)
     with zipfile.ZipFile(path) as zf:
         file_names = set(zf.namelist())
-    return LoadedProject(manifest=container.manifest, state=container.state, file_names=file_names)
+    state_names = sorted(container.states.keys())
+    if STATE_NAME in container.states:
+        state_using = STATE_NAME
+    elif len(container.states) == 1:
+        state_using = state_names[0]
+    else:
+        state_using = None
+    return LoadedProject(
+        manifest=container.manifest, state=container.state, file_names=file_names,
+        state_names=state_names, state_using=state_using,
+    )
 
 
 def _semantic_issues(manifest: dict[str, Any], state: dict[str, Any] | None, file_names: set[str]) -> list[str]:
@@ -159,6 +185,90 @@ def _visible_step_ids(manifest: dict[str, Any], state: dict[str, Any] | None) ->
     return all_ids - hidden
 
 
+def _meta_json(meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": meta.get("id"),
+        "title": meta.get("title"),
+        "kind": meta.get("kind"),
+        "version": meta.get("version"),
+        "authors": meta.get("authors") or [],
+        "license": meta.get("license"),
+        "description": meta.get("description"),
+        "created": meta.get("created"),
+        "updated": meta.get("updated"),
+    }
+
+
+def _resource_json(resource: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": resource.get("id"),
+        "type": resource.get("type"),
+        "name": resource.get("name"),
+        "quantity": resource.get("quantity"),
+        "unit": resource.get("unit"),
+        "bundle": resource.get("bundle"),
+        "source": resource.get("source"),
+        "required": resource.get("required", True),
+        "substitutes": resource.get("substitutes") or [],
+        "part_of": resource.get("part_of"),
+        "kind": resource.get("kind"),
+        "spec_ref": resource.get("spec_ref"),
+    }
+
+
+def _verify_json(step_raw: dict[str, Any]) -> dict[str, Any]:
+    """README §5.2: verify defaults to manual when omitted."""
+    verify = step_raw.get("verify")
+    if not isinstance(verify, dict):
+        return {"type": "manual"}
+    result = dict(verify)
+    result.setdefault("type", "manual")
+    return result
+
+
+def _step_json(
+    step: graph.FlatStep,
+    children: dict[str | None, list[graph.FlatStep]],
+    rank: dict[str, int],
+    progress: dict[str, Any],
+    visible: set[str],
+) -> dict[str, Any]:
+    entry = progress.get(step.id) or {}
+    kids = sorted(children.get(step.id, []), key=lambda s: rank.get(s.id, 0))
+    return {
+        "id": step.id,
+        "title": step.title,
+        "kind": step.kind,
+        "depends_on": step.depends_on,
+        "requires_resources": step.raw.get("requires_resources") or [],
+        "instructions": step.raw.get("instructions"),
+        "attachments": step.raw.get("attachments") or [],
+        "verify": _verify_json(step.raw),
+        "status": entry.get("status", "todo"),
+        "completed_at": entry.get("completed_at"),
+        "notes": entry.get("notes"),
+        "visible": step.id in visible,
+        "steps": [_step_json(kid, children, rank, progress, visible) for kid in kids],
+    }
+
+
+def _branches_json(branches: list[Any], branch_choices: dict[str, str]) -> list[dict[str, Any]]:
+    result = []
+    for branch in branches:
+        if not isinstance(branch, dict):
+            continue
+        result.append({
+            "id": branch.get("id"),
+            "question": branch.get("question"),
+            "options": [
+                {"value": o.get("value"), "chosen_step": o.get("chosen_step") or []}
+                for o in branch.get("options") or [] if isinstance(o, dict)
+            ],
+            "chosen": branch_choices.get(branch.get("id")),
+        })
+    return result
+
+
 @click.group()
 def cli() -> None:
     """atlas: pack, unpack, validate, and inspect .atsx build containers."""
@@ -251,17 +361,39 @@ def unpack(file: Path, output: Path | None, force: bool) -> None:
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
-def validate(path: Path) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Print machine-readable JSON instead of human-readable text.")
+def validate(path: Path, as_json: bool) -> None:
     """Validate a packed .atsx file or an unpacked project folder."""
     try:
         project = _load_project(path)
     except AtsxError as exc:
-        click.echo(f"INVALID: {path}")
-        click.echo(str(exc))
+        if as_json:
+            click.echo(json.dumps({
+                "valid": False, "path": str(path), "build": None, "counts": None, "issues": [str(exc)],
+            }, indent=2))
+        else:
+            click.echo(f"INVALID: {path}")
+            click.echo(str(exc))
         raise SystemExit(1)
 
     issues = _semantic_issues(project.manifest, project.state, project.file_names)
     meta = project.manifest.get("meta", {})
+    counts = {
+        "resources": len(project.manifest.get("resources") or []),
+        "process_steps": len(graph.flatten_steps(project.manifest.get("process") or [])),
+    }
+
+    if as_json:
+        click.echo(json.dumps({
+            "valid": not issues,
+            "path": str(path),
+            "build": {"id": meta.get("id"), "version": meta.get("version")},
+            "counts": counts,
+            "issues": issues,
+        }, indent=2))
+        if issues:
+            raise SystemExit(1)
+        return
 
     if issues:
         click.echo(f"INVALID: {path}")
@@ -273,13 +405,14 @@ def validate(path: Path) -> None:
 
     click.echo(f"OK: {path}")
     click.echo(f"  build: {meta.get('id')} v{meta.get('version')}")
-    click.echo(f"  process steps: {len(graph.flatten_steps(project.manifest.get('process') or []))}")
-    click.echo(f"  resources: {len(project.manifest.get('resources') or [])}")
+    click.echo(f"  process steps: {counts['process_steps']}")
+    click.echo(f"  resources: {counts['resources']}")
 
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
-def status(path: Path) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Print machine-readable JSON instead of the human-readable tree.")
+def status(path: Path, as_json: bool) -> None:
     """Print build progress as a dependency-ordered tree."""
     try:
         project = _load_project(path)
@@ -290,22 +423,22 @@ def status(path: Path) -> None:
     manifest, state = project.manifest, project.state
     meta = manifest.get("meta", {})
 
-    click.echo(f"{meta.get('title', meta.get('id', '?'))}  (v{meta.get('version', '?')})")
-
+    drift_warning = None
     if state is not None and state.get("spec_version") != meta.get("version"):
-        click.echo(
-            f"  [!] WARNING: state.spec_version '{state.get('spec_version')}' differs from "
+        drift_warning = (
+            f"state.spec_version '{state.get('spec_version')}' differs from "
             f"manifest.meta.version '{meta.get('version')}' - the spec changed since this build started."
         )
 
     progress = (state.get("progress") if state else {}) or {}
     flat_steps = graph.flatten_steps(manifest.get("process") or [])
 
+    cycle_warning = None
     try:
         ordered = graph.topological_sort(flat_steps)
         rank = {step.id: i for i, step in enumerate(ordered)}
     except graph.CycleError as exc:
-        click.echo(f"  [!] WARNING: cycle detected among steps ({', '.join(exc.cycle_ids)}) - showing source order.")
+        cycle_warning = f"cycle detected among steps ({', '.join(exc.cycle_ids)}) - showing source order."
         rank = {step.id: i for i, step in enumerate(flat_steps)}
 
     visible = _visible_step_ids(manifest, state)
@@ -315,6 +448,39 @@ def status(path: Path) -> None:
         children.setdefault(step.parent_id, []).append(step)
     for kids in children.values():
         kids.sort(key=lambda s: rank.get(s.id, 0))
+
+    branches = manifest.get("branches") or []
+    branch_choices = (state.get("branch_choices") if state else {}) or {}
+
+    if as_json:
+        total = len(visible)
+        done = sum(1 for step_id in visible if (progress.get(step_id) or {}).get("status") == "done")
+        top_steps = sorted(children.get(None, []), key=lambda s: rank.get(s.id, 0))
+        click.echo(json.dumps({
+            "path": str(path),
+            "meta": _meta_json(meta),
+            "warnings": [w for w in (drift_warning, cycle_warning) if w],
+            "state_instances": {
+                "count": len(project.state_names),
+                "names": project.state_names,
+                "using": project.state_using,
+            },
+            "resources": [_resource_json(r) for r in manifest.get("resources") or [] if isinstance(r, dict)],
+            "steps": [_step_json(s, children, rank, progress, visible) for s in top_steps],
+            "branches": _branches_json(branches, branch_choices),
+            "progress_summary": {
+                "total": total,
+                "done": done,
+                "percent": round(done / total * 100, 1) if total else 0.0,
+            },
+        }, indent=2))
+        return
+
+    click.echo(f"{meta.get('title', meta.get('id', '?'))}  (v{meta.get('version', '?')})")
+    if drift_warning:
+        click.echo(f"  [!] WARNING: {drift_warning}")
+    if cycle_warning:
+        click.echo(f"  [!] WARNING: {cycle_warning}")
 
     click.echo("")
 
@@ -330,8 +496,6 @@ def status(path: Path) -> None:
 
     _print_level(None, 0)
 
-    branches = manifest.get("branches") or []
-    branch_choices = (state.get("branch_choices") if state else {}) or {}
     unresolved = [b for b in branches if isinstance(b, dict) and b.get("id") not in branch_choices]
     if unresolved:
         click.echo("")
@@ -340,6 +504,84 @@ def status(path: Path) -> None:
             click.echo(f"  - {branch.get('id')}: {branch.get('question')}")
             for option in branch.get("options") or []:
                 click.echo(f"      [{option.get('value')}] activates: {', '.join(option.get('chosen_step') or [])}")
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.argument("step_id")
+@click.argument(
+    "status_value", metavar="STATUS",
+    type=click.Choice(["todo", "in_progress", "done", "blocked", "skipped"]),
+)
+def mark(path: Path, step_id: str, status_value: str) -> None:
+    """Set STEP_ID's progress to STATUS in PATH's state.atsx.yaml, creating it if absent.
+
+    Only ever reads/writes the default state.atsx.yaml - per-instance sidecars
+    (README §6.1) are left untouched.
+    """
+    try:
+        project = _load_project(path)
+    except AtsxError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1)
+
+    flat_steps = graph.flatten_steps(project.manifest.get("process") or [])
+    if step_id not in {s.id for s in flat_steps}:
+        click.echo(f"[error] '{step_id}' does not resolve to a real step id", err=True)
+        raise SystemExit(1)
+
+    meta = project.manifest.get("meta", {})
+    state = project.state
+    if state is None:
+        state = {
+            "atlas_state_version": "0.1",
+            "spec_id": meta.get("id"),
+            "spec_version": meta.get("version"),
+            "progress": {},
+        }
+
+    progress = state.setdefault("progress", {})
+    entry = dict(progress.get(step_id) or {})
+    entry["status"] = status_value
+    if status_value == "done":
+        entry["completed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    else:
+        entry.pop("completed_at", None)
+    progress[step_id] = entry
+
+    try:
+        validate_state(state, source=STATE_NAME)
+    except AtsxError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1)
+
+    if path.is_dir():
+        write_state_file(path / STATE_NAME, state)
+    else:
+        write_state_to_atsx(path, state)
+
+    click.echo(f"Marked '{step_id}' as {status_value} in '{path}'")
+
+
+@cli.command()
+@click.argument("info", type=click.Path(exists=True, path_type=Path))
+def info() -> None:
+    """Info about .atsx"""
+    try:
+        project = _load_project(info)
+    except AtsxError as exc:
+        click.echo(str(exc), err=True)
+        raise SystemExit(1)
+
+    meta = project.manifest.get("meta", {})
+    click.echo(f"Build: {meta.get('id')} v{meta.get('version')}")
+    click.echo(f"Title: {meta.get('title')}")
+    click.echo(f"Kind: {meta.get('kind')}")
+    click.echo(f"Authors: {', '.join(meta.get('authors') or [])}")
+    click.echo(f"License: {meta.get('license')}")
+    click.echo(f"Description: {meta.get('description')}")
+    click.echo(f"Created: {meta.get('created')}")
+    click.echo(f"Updated: {meta.get('updated')}")
 
 
 def main() -> None:

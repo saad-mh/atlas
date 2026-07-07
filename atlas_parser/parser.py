@@ -6,6 +6,7 @@ An .atsx file is a zip archive holding manifest.atsx.yaml (required), an optiona
 from __future__ import annotations
 
 import datetime
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,7 @@ from .errors import (
 from .schemas import validate_manifest, validate_state
 
 MANIFEST_NAME = "manifest.atsx.yaml"
+STATE_NAME = "state.atsx.yaml"
 
 
 def _is_state_filename(name: str) -> bool:
@@ -163,3 +165,31 @@ def parse_state_file(path: str | Path) -> dict:
     data = _load_yaml(path.read_bytes(), str(path))
     validate_state(data, source=str(path))
     return data
+
+
+def _dump_state_yaml(state: dict) -> bytes:
+    return yaml.safe_dump(state, sort_keys=False, default_flow_style=False).encode("utf-8")
+
+
+def write_state_file(path: str | Path, state: dict) -> None:
+    """Write STATE as state.atsx.yaml at PATH inside an unpacked project folder (README §2)."""
+    Path(path).write_bytes(_dump_state_yaml(state))
+
+
+def write_state_to_atsx(atsx_path: str | Path, state: dict) -> None:
+    """Replace (or add) state.atsx.yaml inside an existing .atsx zip, leaving every other member - including any state.<instance_id>.atsx.yaml sidecars (README §6.1) - byte-identical.
+
+    zipfile has no in-place update, so this rebuilds the archive into a sibling temp file and atomically swaps it in.
+    """
+    atsx_path = Path(atsx_path)
+    zinfo = zipfile.ZipInfo(STATE_NAME, date_time=time.localtime()[:6])
+    zinfo.compress_type = zipfile.ZIP_STORED
+
+    tmp_path = atsx_path.with_name(atsx_path.name + ".tmp")
+    with zipfile.ZipFile(atsx_path) as src, zipfile.ZipFile(tmp_path, "w") as dst:
+        for item in src.infolist():
+            if item.filename == STATE_NAME:
+                continue
+            dst.writestr(item, src.read(item.filename))
+        dst.writestr(zinfo, _dump_state_yaml(state))
+    tmp_path.replace(atsx_path)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from atlas_parser.cli import cli
@@ -265,3 +267,201 @@ def test_status_drift_warning(tmp_path: Path, runner: CliRunner):
     assert result.exit_code == 0
     assert "WARNING" in result.output
     assert "0.9.0" in result.output
+
+
+def find_step(steps: list[dict], step_id: str) -> dict | None:
+    for step in steps:
+        if step["id"] == step_id:
+            return step
+        found = find_step(step["steps"], step_id)
+        if found is not None:
+            return found
+    return None
+
+
+def test_validate_json_ok(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
+
+    result = runner.invoke(cli, ["validate", str(folder), "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data == {
+        "valid": True,
+        "path": str(folder),
+        "build": {"id": "widget-mount", "version": "1.0.0"},
+        "counts": {"resources": 2, "process_steps": 6},
+        "issues": [],
+    }
+
+
+def test_validate_json_reports_semantic_issues(tmp_path: Path, runner: CliRunner):
+    manifest = MANIFEST_WITH_BRANCH.replace(
+        "depends_on: [prep]\n    requires_resources: [cad-file]\n  - id: cut-mount",
+        "depends_on: [prep, no-such-step]\n    requires_resources: [cad-file]\n  - id: cut-mount",
+    )
+    folder = make_project(tmp_path, "proj", manifest)
+
+    result = runner.invoke(cli, ["validate", str(folder), "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert data["valid"] is False
+    assert data["build"] == {"id": "widget-mount", "version": "1.0.0"}
+    assert any("no-such-step' does not resolve to a real step id" in issue for issue in data["issues"])
+
+
+def test_validate_json_reports_parse_error(tmp_path: Path, runner: CliRunner):
+    folder = tmp_path / "empty"
+    folder.mkdir()
+
+    result = runner.invoke(cli, ["validate", str(folder), "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert data["valid"] is False
+    assert data["build"] is None
+    assert data["counts"] is None
+    assert "manifest.atsx.yaml" in data["issues"][0]
+
+
+def test_status_json_shape(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH, state=STATE_IN_PROGRESS)
+
+    result = runner.invoke(cli, ["status", str(folder), "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+
+    assert data["meta"]["id"] == "widget-mount"
+    assert data["meta"]["version"] == "1.0.0"
+    assert data["warnings"] == []
+    assert data["state_instances"] == {"count": 1, "names": ["state.atsx.yaml"], "using": "state.atsx.yaml"}
+    assert {r["id"] for r in data["resources"]} == {"cad-file", "screws"}
+
+    # cut-mount is hidden: laser-cut option wasn't chosen (fabrication-method: 3d-print)
+    all_top_ids = {s["id"] for s in data["steps"]}
+    assert all_top_ids == {"prep", "print-mount", "cut-mount", "assemble"}
+    assert data["steps"][0]["id"] == "prep"
+
+    prep = find_step(data["steps"], "prep")
+    assert prep["status"] == "done"
+    print_mount = find_step(data["steps"], "print-mount")
+    assert print_mount["status"] == "in_progress"
+    cut_mount = find_step(data["steps"], "cut-mount")
+    assert cut_mount["visible"] is False
+
+    assemble = find_step(data["steps"], "assemble")
+    assert assemble["kind"] == "group"
+    assert [s["id"] for s in assemble["steps"]] == ["attach", "route"]
+
+    branch = data["branches"][0]
+    assert branch["id"] == "fabrication-method"
+    assert branch["chosen"] == "3d-print"
+    assert {o["value"] for o in branch["options"]} == {"3d-print", "laser-cut"}
+
+    # visible steps: prep, print-mount, assemble, attach, route (cut-mount hidden) = 5, 1 done
+    assert data["progress_summary"] == {"total": 5, "done": 1, "percent": 20.0}
+
+
+def test_status_json_drift_warning(tmp_path: Path, runner: CliRunner):
+    drifted_state = STATE_IN_PROGRESS.replace('spec_version: "1.0.0"', 'spec_version: "0.9.0"')
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH, state=drifted_state)
+
+    result = runner.invoke(cli, ["status", str(folder), "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert len(data["warnings"]) == 1
+    assert "0.9.0" in data["warnings"][0]
+
+
+def test_status_json_no_state_all_visible(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
+
+    result = runner.invoke(cli, ["status", str(folder), "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["state_instances"] == {"count": 0, "names": [], "using": None}
+    assert all(s["visible"] for s in data["steps"])  # no branch choice yet -> nothing hidden
+    assert data["progress_summary"] == {"total": 6, "done": 0, "percent": 0.0}
+
+
+def test_mark_creates_fresh_state(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
+
+    result = runner.invoke(cli, ["mark", str(folder), "prep", "done"])
+
+    assert result.exit_code == 0, result.output
+    state = yaml.safe_load((folder / "state.atsx.yaml").read_text())
+    assert state["spec_id"] == "widget-mount"
+    assert state["spec_version"] == "1.0.0"
+    assert state["progress"]["prep"]["status"] == "done"
+    assert "completed_at" in state["progress"]["prep"]
+
+
+def test_mark_updates_existing_state_preserves_other_entries(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH, state=STATE_IN_PROGRESS)
+
+    result = runner.invoke(cli, ["mark", str(folder), "print-mount", "done"])
+
+    assert result.exit_code == 0, result.output
+    state = yaml.safe_load((folder / "state.atsx.yaml").read_text())
+    assert state["progress"]["prep"]["status"] == "done"  # untouched
+    assert state["progress"]["print-mount"]["status"] == "done"
+    assert "completed_at" in state["progress"]["print-mount"]
+    assert state["branch_choices"] == {"fabrication-method": "3d-print"}  # untouched
+
+
+def test_mark_clears_completed_at_when_moved_off_done(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
+    runner.invoke(cli, ["mark", str(folder), "prep", "done"])
+
+    result = runner.invoke(cli, ["mark", str(folder), "prep", "todo"])
+
+    assert result.exit_code == 0, result.output
+    state = yaml.safe_load((folder / "state.atsx.yaml").read_text())
+    assert state["progress"]["prep"]["status"] == "todo"
+    assert "completed_at" not in state["progress"]["prep"]
+
+
+def test_mark_rejects_unknown_step(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
+
+    result = runner.invoke(cli, ["mark", str(folder), "no-such-step", "done"])
+
+    assert result.exit_code == 1
+    assert "does not resolve to a real step id" in result.output
+
+
+def test_mark_rejects_invalid_status(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
+
+    result = runner.invoke(cli, ["mark", str(folder), "prep", "not-a-status"])
+
+    assert result.exit_code == 2  # click's own Choice validation error
+
+
+def test_mark_on_packed_atsx_preserves_other_members(tmp_path: Path, runner: CliRunner):
+    folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
+    packed = tmp_path / "out.atsx"
+    runner.invoke(cli, ["pack", str(folder), "-o", str(packed)])
+
+    result = runner.invoke(cli, ["mark", str(packed), "prep", "in_progress"])
+    assert result.exit_code == 0, result.output
+
+    with zipfile.ZipFile(packed) as zf:
+        names = set(zf.namelist())
+        assert names == {"manifest.atsx.yaml", "resources/mount.svg", "state.atsx.yaml"}
+        assert zf.read("resources/mount.svg") == b"<svg/>"
+        assert zf.getinfo("manifest.atsx.yaml").compress_type == zipfile.ZIP_STORED
+        assert zf.getinfo("state.atsx.yaml").compress_type == zipfile.ZIP_STORED
+        state = yaml.safe_load(zf.read("state.atsx.yaml"))
+        assert state["progress"]["prep"]["status"] == "in_progress"
+
+    # status --json still loads cleanly after the rewrite
+    status_result = runner.invoke(cli, ["status", str(packed), "--json"])
+    assert status_result.exit_code == 0, status_result.output
+    data = json.loads(status_result.output)
+    assert find_step(data["steps"], "prep")["status"] == "in_progress"
