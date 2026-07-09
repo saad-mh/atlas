@@ -152,6 +152,21 @@ def test_pack_refuses_invalid_manifest(tmp_path: Path, runner: CliRunner):
     assert not output.exists()
 
 
+def test_pack_refuses_dangling_step_reference(tmp_path: Path, runner: CliRunner):
+    manifest = MANIFEST_WITH_BRANCH.replace(
+        "  - id: prep\n    title: \"Prep workspace\"\n    depends_on: []\n",
+        "  - id: prep\n    title: \"Prep workspace\"\n    depends_on: [does-not-exist]\n",
+    )
+    folder = make_project(tmp_path, "proj", manifest)
+    output = tmp_path / "out.atsx"
+
+    result = runner.invoke(cli, ["pack", str(folder), "-o", str(output)])
+
+    assert result.exit_code == 1
+    assert "does-not-exist" in result.output
+    assert not output.exists()
+
+
 def test_unpack_roundtrip(tmp_path: Path, runner: CliRunner):
     folder = make_project(tmp_path, "proj", MANIFEST_WITH_BRANCH)
     packed = tmp_path / "out.atsx"

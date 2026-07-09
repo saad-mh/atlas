@@ -291,11 +291,20 @@ def pack(folder: Path, output: Path | None) -> None:
     state_path = folder / STATE_NAME
     try:
         manifest = parse_manifest_file(manifest_path)
-        if state_path.is_file():
-            parse_state_file(state_path)
+        state = parse_state_file(state_path) if state_path.is_file() else None
     except AtsxError as exc:
         click.echo("INVALID - refusing to pack:", err=True)
         click.echo(str(exc), err=True)
+        raise SystemExit(1)
+
+    file_names = {
+        str(p.relative_to(folder).as_posix()) for p in folder.rglob("*") if p.is_file()
+    }
+    issues = _semantic_issues(manifest, state, file_names)
+    if issues:
+        click.echo("INVALID - refusing to pack:", err=True)
+        for issue in issues:
+            click.echo(f"  - {issue}", err=True)
         raise SystemExit(1)
 
     if output is None:
@@ -578,7 +587,7 @@ def info(path: Path | None, as_json: bool) -> None:
                 "parser": pkg_info.title, "version": pkg_info.version, "author": pkg_info.author, "license": pkg_info.license,
             }, indent=2))
             return
-        click.echo(f"Parser: {pkg_info.title}")
+        click.echo(f"Application: {pkg_info.title}")
         click.echo(f"Version: {pkg_info.version}")
         click.echo(f"Author: {pkg_info.author}")
         click.echo(f"License: {pkg_info.license}")
@@ -607,7 +616,6 @@ def info(path: Path | None, as_json: bool) -> None:
 
 def main() -> None:
     cli()
-
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,4 @@
 title = "Atlas Parser"
 version = "0.1.0"
-author = "Mohammed Saad"
+author = "Saad"
 license = "GPLv3"

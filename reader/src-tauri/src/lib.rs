@@ -43,12 +43,38 @@ fn mark_step(path: String, step_id: String, status: String) -> Result<Value, Str
     run_atlas_json(&["status", "--json", &path])
 }
 
+/// Writes the creator wizard's assembled `manifest.atsx.yaml` into a fresh
+/// temp folder, then shells out to `atlas pack` on that folder - same as a
+/// human packing a folder by hand. Keeps all schema/DAG validation and zip
+/// logic in the one place it already lives (the Python CLI); this command
+/// is just the "assemble a folder, then invoke pack" glue. The temp folder
+/// is removed automatically when it goes out of scope, on every path.
+#[tauri::command]
+fn export_atsx(manifest_yaml: String, output_path: String) -> Result<String, String> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("atlas-export-")
+        .tempdir()
+        .map_err(|e| format!("failed to create a temp folder for export: {e}"))?;
+
+    let manifest_path = temp_dir.path().join("manifest.atsx.yaml");
+    std::fs::write(&manifest_path, manifest_yaml)
+        .map_err(|e| format!("failed to write manifest.atsx.yaml: {e}"))?;
+
+    let temp_dir_str = temp_dir
+        .path()
+        .to_str()
+        .ok_or_else(|| "temp folder path is not valid UTF-8".to_string())?;
+
+    run_atlas(&["pack", temp_dir_str, "-o", &output_path])?;
+    Ok(output_path)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![load_atsx, mark_step])
+        .invoke_handler(tauri::generate_handler![load_atsx, mark_step, export_atsx])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

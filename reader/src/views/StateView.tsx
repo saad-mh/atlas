@@ -32,7 +32,7 @@ export function StateView({ status }: { status: AtsxStatus }) {
       {state_instances.count > 1 && (
         <div className="banner banner--info">
           <p>
-            {state_instances.count} build instances found in this file — showing{" "}
+            {state_instances.count} build instances found in this file - showing{" "}
             <code>{state_instances.using ?? "the default"}</code>. Switching between instances isn't supported yet.
           </p>
         </div>
