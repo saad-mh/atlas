@@ -287,3 +287,5 @@ If several people build from the same `.atsx`, the reader app can maintain multi
 - [x] Reference CLI: `atlas validate`, `atlas status`, `atlas pack` (folder → `.atsx`), `atlas unpack`. See [CLI.md](CLI.md).
 - [ ] Reader app: renders resources / process / state as distinct views, handles branch prompts, tracks progress.
 - [ ] `1.0` once schema + CLI + one real project (yours) have round-tripped cleanly.
+
+a
