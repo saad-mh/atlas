@@ -27,7 +27,7 @@ An `.atsx` file is a **zip archive** with a fixed internal layout, using the `.a
 project.atsx  (zip container)
 │
 ├── manifest.atsx.yaml      # REQUIRED. The spec itself: meta + resources + process + branches
-├── state.atsx.yaml         # OPTIONAL. Progress tracking (see §6). Absent = fresh, unstarted copy.
+├── state.atsx.yaml         # OPTIONAL. Progress tracking (step statuses, branch choices). Absent = fresh, unstarted copy.
 │
 ├── resources/              # OPTIONAL. Bundled/snapshotted dependency files.
 │   ├── environment.yml     #   e.g. a real conda env file, embedded verbatim
@@ -66,12 +66,12 @@ meta:
   created: 2026-07-07
   updated: 2026-07-07
 
-resources: [ ... ]                  # see §4
-process: [ ... ]                    # see §5
-branches: [ ... ]                   # see §5.3
+resources: [ ... ]                  # parts, packages, tools (Resource layer)
+process: [ ... ]                    # steps forming a DAG (Process layer)
+branches: [ ... ]                   # choices that gate which steps apply
 ```
 
-`meta.id` + `meta.version` together are the identity of a build - the state sidecar checks these to detect drift (§6.3).
+`meta.id` + `meta.version` together are the identity of a build - the state file records them so a reader can detect that the spec changed after the builder started (see Drift detection below).
 
 ---
 
@@ -110,7 +110,7 @@ resources:
   - id: drive-subassembly
     type: subassembly
     name: "Omnidirectional drive base"
-    spec_ref: "nested"               # see §4.3 - this resource is itself an .atsx-shaped tree
+    spec_ref: "nested"               # this resource is itself an .atsx-shaped tree (see Sub-assemblies below)
 
   - id: motor
     type: hardware
@@ -131,7 +131,7 @@ resources:
 | `source` | optional | Where to get it if not bundled (URL, store name, package registry). |
 | `required` | optional, default `true` | `false` = optional/nice-to-have. |
 | `substitutes` | optional | Ranked fallback list, each with a `note`. Empty/absent = no substitutes. |
-| `part_of` | optional | `id` of a `subassembly`-type resource this belongs to. See §4.3. |
+| `part_of` | optional | `id` of a `subassembly`-type resource this belongs to (see Sub-assemblies below). |
 
 ### 4.2 Why `bundle` instead of always `source`
 If you have a real `environment.yml`, a `package-lock.json`, or a BOM CSV export, drop it under `resources/` in the zip and point `bundle` at it. The reader app can hand that file straight to pip/npm/conda/whatever. That way you're not re-encoding dependency data into a new schema, and the receiver isn't stuck fetching a second file from somewhere else. `source` is for things that genuinely can't be, or shouldn't be bundled (large model weights, a physical part from a supplier).
@@ -197,7 +197,7 @@ process:
 | `kind` | optional, default `task` | `task` \| `group` (has nested `steps`) \| `checkpoint` |
 | `instructions` | optional | Free text / markdown. The actual how-to. |
 | `attachments` | optional | List of relative paths into `attachments/`. |
-| `verify` | optional | See §5.2. |
+| `verify` | optional | Completion check; `manual` if omitted (see Verification below). |
 
 ### 5.2 Verification
 | `type` | Meaning |
@@ -207,7 +207,7 @@ process:
 | `checksum` | Reader checks a file hash matches. |
 | `command` | Reader runs a shell command, checks exit code. |
 
-`command` verification is deferred to sandboxing design (open question, §7) - until that's resolved, reader apps should treat `command` verify steps as opt-in and require explicit user confirmation before running.
+`command` verification is deferred to sandboxing design (see Open questions below) - until that's resolved, reader apps should treat `command` verify steps as opt-in and require explicit user confirmation before running.
 
 ### 5.3 Branches (variability)
 Real builds fork on real-world choices - fabrication method, platform, available tools. Branches let one `.atsx` represent several valid paths instead of forcing one canonical build.
@@ -284,7 +284,7 @@ If several people build from the same `.atsx`, the reader app can maintain multi
 
 - [ ] `0.1` - this spec, frozen enough to build against.
 - [x] JSON Schema for `manifest.atsx.yaml` and `state.atsx.yaml` (validation).
-- [x] Reference CLI: `atlas validate`, `atlas status`, `atlas pack` (folder → `.atsx`), `atlas unpack`. See [CLI.md](CLI.md).
+- [x] Reference CLI: `atlas validate`, `atlas status`, `atlas pack` (folder → `.atsx`), `atlas unpack`. Install and usage are in RUN.md.
 - [ ] Reader app: renders resources / process / state as distinct views, handles branch prompts, tracks progress.
 - [ ] `1.0` once schema + CLI + one real project (yours) have round-tripped cleanly.
 

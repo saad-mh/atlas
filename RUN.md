@@ -43,7 +43,7 @@ Tauri + React desktop app that opens a `.atsx` file and renders its
 Resources/Process/State views. Lives in [`reader/`](reader/).
 
 Prerequisites:
-- `atlas` on `PATH` - install the CLI first (see above); the reader shells
+- `atlas` on `PATH` - install the CLI first (the `pip install -e .` step in the CLI section); the reader shells
   out to it and does no parsing of its own.
 - Node.js + npm
 - Rust (`rustc`/`cargo` - e.g. `brew install rust`, or via
